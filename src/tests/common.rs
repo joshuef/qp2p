@@ -388,9 +388,9 @@ async fn multiple_connections_with_many_concurrent_messages() -> Result<()> {
 
     utils::init_logging();
 
-    let num_senders: usize = 10;
+    let num_senders: usize = 500;
     let num_messages_each: usize = 100;
-    let num_messages_total: usize = 1000;
+    let num_messages_total: usize = 100000;
 
     let qp2p = new_qp2p()?;
     let (server_endpoint, _, mut recv_incoming_messages, _) = qp2p.new_endpoint().await?;
@@ -487,6 +487,114 @@ async fn multiple_connections_with_many_concurrent_messages() -> Result<()> {
     let _ = future::try_join_all(tasks).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn multiple_connections_with_many_larger_concurrent_messages() -> Result<()> {
+    use futures::future;
+
+    utils::init_logging();
+
+    let num_senders: usize = 500;
+    let num_messages_each: usize = 100;
+    let num_messages_total: usize = 100000;
+
+    let qp2p = new_qp2p()?;
+    let (server_endpoint, _, mut recv_incoming_messages, _) = qp2p.new_endpoint().await?;
+    let server_addr = server_endpoint.socket_addr();
+
+    let test_msgs: Vec<_> = (0..num_messages_each).map(|_| random_msg(1024*1024*2)).collect();
+    let sending_msgs = test_msgs.clone();
+
+    let mut tasks = Vec::new();
+
+    // Receiver
+    tasks.push(tokio::spawn({
+        async move {
+            let mut num_received = 0;
+            let mut sending_tasks = Vec::new();
+
+            while let Some((src, msg)) = recv_incoming_messages.next().await {
+                log::info!("received from {:?} with message size {}", src, msg.len());
+                assert_eq!(msg.len(), test_msgs[0].len());
+
+                let sending_endpoint = server_endpoint.clone();
+
+                sending_tasks.push(tokio::spawn({
+                    async move {
+                        // Hash the inputs for couple times to simulate certain workload.
+                        let hash_result = hash(&msg);
+                        for _ in 0..5 {
+                            let _ = hash(&msg);
+                        }
+                        // Send the hash result back.
+                        sending_endpoint.connect_to(&src).await?;
+                        sending_endpoint
+                            .send_message(hash_result.to_vec().into(), &src)
+                            .await?;
+
+                        Ok::<_, anyhow::Error>(())
+                    }
+                }));
+
+                num_received += 1;
+                if num_received >= num_messages_total {
+                    break;
+                }
+            }
+
+            let _ = future::try_join_all(sending_tasks).await?;
+
+            Ok(())
+        }
+    }));
+
+    // Sender
+    for id in 0..num_senders {
+        let messages = sending_msgs.clone();
+        tasks.push(tokio::spawn({
+            let qp2p = new_qp2p()?;
+            let (send_endpoint, _, mut recv_incoming_messages, _) = qp2p.new_endpoint().await?;
+
+            async move {
+                let mut hash_results = BTreeSet::new();
+                log::info!("connecting {}", id);
+                send_endpoint.connect_to(&server_addr).await?;
+                for (index, message) in messages.iter().enumerate().take(num_messages_each) {
+                    let _ = hash_results.insert(hash(&message));
+                    log::info!("sender #{} sending message #{}", id, index);
+                    send_endpoint
+                        .send_message(message.clone(), &server_addr)
+                        .await?;
+                }
+
+                log::info!(
+                    "sender #{} completed sending messages, starts listening",
+                    id
+                );
+
+                while let Some((src, msg)) = recv_incoming_messages.next().await {
+                    log::info!(
+                        "#{} received from server {:?} with message size {}",
+                        id,
+                        src,
+                        msg.len()
+                    );
+                    assert!(hash_results.remove(&msg[..]));
+                    if hash_results.is_empty() {
+                        break;
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(())
+            }
+        }));
+    }
+
+    let _ = future::try_join_all(tasks).await?;
+    Ok(())
+}
+
+
 
 #[tokio::test]
 async fn many_messages() -> Result<()> {
