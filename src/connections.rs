@@ -210,7 +210,7 @@ async fn read_on_uni_streams(
     uni_streams: &mut quinn::IncomingUniStreams,
     peer_addr: SocketAddr,
     message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-) {
+) -> Result<()>{
     while let Some(result) = uni_streams.next().await {
         match result {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
@@ -236,12 +236,14 @@ async fn read_on_uni_streams(
                             "Failed reading from a uni-stream for peer {:?} with error: {:?}",
                             peer_addr, err
                         );
-                        break;
+                        return Err(err);
                     }
                 }
             },
         }
     }
+
+    Ok(())
 }
 
 // Read messages sent by peer in a bidirectional stream.
